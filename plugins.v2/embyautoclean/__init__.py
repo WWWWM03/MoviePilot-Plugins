@@ -71,7 +71,7 @@ class EmbyAutoClean(_PluginBase):
     # 插件图标
     plugin_icon = "clean.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "WWWWM03"
     # 作者主页
@@ -108,6 +108,9 @@ class EmbyAutoClean(_PluginBase):
     _notify_type: str = "MediaServer"
 
     _manual_servers: str = ""
+
+    # v1.2.0 收藏诊断模式（不执行任何删除，仅输出每个用户的收藏清单）
+    _diagnose_favorites: bool = False
 
     # 内部
     _scheduler: Optional[BackgroundScheduler] = None
@@ -150,6 +153,8 @@ class EmbyAutoClean(_PluginBase):
 
             self._manual_servers = config.get("manual_servers") or ""
 
+            self._diagnose_favorites = bool(config.get("diagnose_favorites", False))
+
         if self._enabled and self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             logger.info("Emby媒体自动清理 - 立即运行一次")
@@ -179,6 +184,7 @@ class EmbyAutoClean(_PluginBase):
                 "skip_if_played": self._skip_if_played,
                 "notify_type": self._notify_type,
                 "manual_servers": self._manual_servers,
+                "diagnose_favorites": self._diagnose_favorites,
             })
 
             if self._scheduler.get_jobs():
@@ -289,12 +295,24 @@ class EmbyAutoClean(_PluginBase):
     # ───────── 主流程 ─────────
     def __run(self):
         """
-        主入口：遍历所有 Emby 服务器并执行清理
+        主入口：遍历所有 Emby 服务器并执行清理或收藏诊断
         """
         if not self._enabled:
             return
         infos = self.service_infos
         if not infos:
+            return
+
+        if self._diagnose_favorites:
+            logger.info(
+                f"EmbyAutoClean 进入【收藏诊断】模式（不会执行任何删除），"
+                f"收藏范围：{self._favorite_scope}，媒体类型：{self._media_types}"
+            )
+            for server_name, svc in infos.items():
+                try:
+                    self.__run_diagnose(server_name, svc)
+                except Exception as e:
+                    logger.error(f"EmbyAutoClean 诊断服务器 {server_name} 时发生异常：{e}", exc_info=True)
             return
 
         logger.info(
@@ -318,8 +336,15 @@ class EmbyAutoClean(_PluginBase):
         fav_user_ids = self.__get_favorite_user_ids(svc)
         logger.info(f"[{server_name}] 收藏检查用户数：{len(fav_user_ids)}")
 
+        # v1.2.0：选择一个 viewer 用户用于主查询（拿到 UserData 字段做快速剪枝）
+        viewer_uid = self.__pick_viewer_uid(svc, fav_user_ids)
+        if viewer_uid:
+            logger.info(f"[{server_name}] 主查询 viewer_uid={viewer_uid[:8]}...")
+        else:
+            logger.warning(f"[{server_name}] 未找到合适的 viewer 用户，将使用顶层端点兜底查询")
+
         library_ids = self.__resolve_library_ids(svc)
-        candidates = self.__fetch_candidates(svc, library_ids=library_ids)
+        candidates = self.__fetch_candidates(svc, viewer_uid=viewer_uid, library_ids=library_ids)
         logger.info(f"[{server_name}] 获取到候选条目数：{len(candidates)}")
 
         deleted_count = 0
@@ -330,7 +355,7 @@ class EmbyAutoClean(_PluginBase):
                 logger.info(f"[{server_name}] 达到单次最大删除数 {self._max_deletions}，停止")
                 break
 
-            should_del, reason = self.__should_delete(item, fav_user_ids, svc)
+            should_del, reason = self.__should_delete(item, fav_user_ids, svc, viewer_uid)
             if not should_del:
                 skipped_count += 1
                 logger.debug(f"[{server_name}] 跳过 {item.get('Name')}：{reason}")
@@ -431,12 +456,24 @@ class EmbyAutoClean(_PluginBase):
         logger.info(f"EmbyAutoClean 匹配到媒体库 ID：{ids}")
         return ids
 
-    def __fetch_candidates(self, svc, library_ids: List[str]) -> List[dict]:
+    def __fetch_candidates(self, svc, viewer_uid: Optional[str],
+                           library_ids: List[str]) -> List[dict]:
         """
-        分页拉取候选条目；若 library_ids 非空则分别按 ParentId 查询并合并
+        分页拉取候选条目。
+
+        v1.2.0 修复：使用用户维度端点 emby/Users/{uid}/Items，以便：
+        1) 返回的 UserData 字段可直接用于 viewer 快速剪枝
+        2) 彻底规避服务端 Filters=IsNotFavorite 在顶层 /emby/Items 上不生效的 bug
+        全部条目拉回客户端再做收藏/播放/关键字/标签判定，保证正确性。
         """
         include_types = ",".join(self._media_types or [])
         fields = "DateCreated,UserData,Path,ProviderIds,Tags,Genres,ProductionYear,OriginalTitle"
+
+        if viewer_uid:
+            endpoint = f"emby/Users/{viewer_uid}/Items"
+        else:
+            # 兜底：无任何可用用户时走顶层
+            endpoint = "emby/Items"
 
         all_items: List[dict] = []
 
@@ -448,7 +485,6 @@ class EmbyAutoClean(_PluginBase):
                     "Recursive": "true",
                     "IncludeItemTypes": include_types,
                     "Fields": fields,
-                    "Filters": "IsNotFavorite",
                     "StartIndex": start,
                     "Limit": limit,
                     "SortBy": "DateCreated",
@@ -457,7 +493,7 @@ class EmbyAutoClean(_PluginBase):
                 if parent_id:
                     params["ParentId"] = parent_id
 
-                res = self.__emby_get(svc, "emby/Items", params=params)
+                res = self.__emby_get(svc, endpoint, params=params)
                 if res is None:
                     return
                 try:
@@ -535,8 +571,10 @@ class EmbyAutoClean(_PluginBase):
 
     # ───────── 判定 ─────────
     def __should_delete(
-        self, item: dict, fav_user_ids: List[str], svc
+        self, item: dict, fav_user_ids: List[str], svc, viewer_uid: Optional[str]
     ) -> Tuple[bool, str]:
+        ud = item.get("UserData") or {}
+
         # 1. 日期
         dc_str = item.get("DateCreated")
         if not dc_str:
@@ -548,13 +586,17 @@ class EmbyAutoClean(_PluginBase):
         if dc > threshold:
             return False, f"未到期（{dc.date()} > {threshold.date()}）"
 
-        # 2. 已播放
+        # 2. 已播放（viewer 视角，主查询直接带回）
         if self._skip_if_played:
-            ud = item.get("UserData") or {}
             if (ud.get("PlayCount") or 0) > 0 or (ud.get("PlaybackPositionTicks") or 0) > 0:
-                return False, "已有播放记录"
+                return False, "已有播放记录（viewer）"
 
-        # 3. 排除关键字
+        # 3. viewer 收藏快速剪枝（UserData 已随主查询返回）
+        if ud.get("IsFavorite"):
+            short_uid = viewer_uid[:8] if viewer_uid else "?"
+            return False, f"被 viewer({short_uid}) 收藏"
+
+        # 4. 排除关键字
         kws = [k.strip() for k in (self._exclude_keywords or "").splitlines() if k.strip()]
         if kws:
             name = str(item.get("Name", "")).lower()
@@ -563,7 +605,7 @@ class EmbyAutoClean(_PluginBase):
                 if kw.lower() in name or kw.lower() in orig:
                     return False, f"命中排除关键字：{kw}"
 
-        # 4. 排除标签
+        # 5. 排除标签
         tags_cfg = {t.strip().lower() for t in (self._exclude_tags or "").splitlines() if t.strip()}
         if tags_cfg:
             item_tags = {str(t).lower() for t in (item.get("Tags") or [])}
@@ -571,19 +613,162 @@ class EmbyAutoClean(_PluginBase):
             if hit:
                 return False, f"命中排除标签：{','.join(hit)}"
 
-        # 5. 收藏判定
-        if fav_user_ids:
-            # 主查询已经做了 IsNotFavorite 粗筛（基于默认账号）
-            # 对 admin_only / specific_users 场景需要精确核对
-            # 对 any_user 场景需要逐用户确认
-            if self._favorite_scope == "any_user":
-                if self.__is_favorited_by_any(svc, item.get("Id"), fav_user_ids):
-                    return False, "被任一用户收藏"
-            else:
-                if self.__is_favorited_by_any(svc, item.get("Id"), fav_user_ids):
-                    return False, f"被{self._favorite_scope}收藏"
+        # 6. 剩余目标用户补查（排除 viewer 本身，只查还没查过的）
+        other_uids = [u for u in (fav_user_ids or []) if u and u != viewer_uid]
+        if other_uids:
+            if self.__is_favorited_by_any(svc, item.get("Id"), other_uids):
+                scope_label = {
+                    "any_user": "任一用户",
+                    "admin_only": "管理员",
+                    "specific_users": "指定用户",
+                }.get(self._favorite_scope, self._favorite_scope)
+                return False, f"被{scope_label}收藏（非 viewer）"
 
         return True, "符合清理条件"
+
+    def __pick_viewer_uid(self, svc, fav_user_ids: List[str]) -> Optional[str]:
+        """
+        选择一个 Emby 用户作为主查询 viewer，其 UserData 将随主查询返回。
+        策略（v1.2.0）：
+            admin_only       -> fav_user_ids[0]（已被过滤为 admin）
+            specific_users   -> fav_user_ids[0]
+            any_user         -> 优先 admin，找不到取 fav_user_ids[0]
+            三者都空         -> None（兜底走顶层 emby/Items）
+        """
+        if not fav_user_ids:
+            return None
+        if (self._favorite_scope or "any_user") == "any_user":
+            # 重新读一次用户列表找 admin（避免重复缓存复杂度）
+            res = self.__emby_get(svc, "emby/Users")
+            try:
+                users = res.json() if res is not None and hasattr(res, "json") else None
+            except Exception:
+                users = None
+            if isinstance(users, list):
+                for u in users:
+                    uid = u.get("Id")
+                    is_admin = (u.get("Policy") or {}).get("IsAdministrator")
+                    if uid and is_admin and uid in fav_user_ids:
+                        return uid
+        return fav_user_ids[0]
+
+    def __run_diagnose(self, server_name: str, svc):
+        """
+        v1.2.0 新增：收藏诊断模式
+        - 对 fav_user_ids 中的每个用户，调 GET emby/Users/{uid}/Items?Filters=IsFavorite
+        - 打印每个用户的完整收藏清单到日志，便于与 Emby UI「最爱」对照验证
+        - 若开启通知，发送 1 条汇总通知（截断前 20 条）
+        - 全程不触发 DELETE，不写历史
+        """
+        logger.info(f"[{server_name}] ===== 收藏诊断开始 =====")
+
+        fav_user_ids = self.__get_favorite_user_ids(svc)
+        logger.info(f"[{server_name}] scope={self._favorite_scope}，检查用户数={len(fav_user_ids)}")
+        if not fav_user_ids:
+            logger.warning(f"[{server_name}] 没有可检查的用户（scope 过滤后为空）")
+            return
+
+        # 拿用户名映射（uid -> name）
+        uid_to_name: Dict[str, str] = {}
+        res_users = self.__emby_get(svc, "emby/Users")
+        try:
+            users = res_users.json() if res_users is not None and hasattr(res_users, "json") else None
+        except Exception:
+            users = None
+        if isinstance(users, list):
+            for u in users:
+                uid = u.get("Id")
+                if uid:
+                    uid_to_name[uid] = str(u.get("Name") or "")
+
+        include_types = ",".join(self._media_types or [])
+        fields = "DateCreated,UserData,ProductionYear,OriginalTitle"
+
+        all_favorited: Dict[str, dict] = {}  # 去重：item_id -> item
+        per_user_counts: List[Tuple[str, str, int]] = []  # (uid, name, count)
+
+        for uid in fav_user_ids:
+            uname = uid_to_name.get(uid, uid[:8])
+            items_for_user: List[dict] = []
+            start = 0
+            limit = 200
+            while True:
+                params = {
+                    "Recursive": "true",
+                    "IncludeItemTypes": include_types,
+                    "Fields": fields,
+                    "Filters": "IsFavorite",
+                    "StartIndex": start,
+                    "Limit": limit,
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                }
+                res = self.__emby_get(svc, f"emby/Users/{uid}/Items", params=params)
+                if res is None:
+                    break
+                try:
+                    data = res.json() if hasattr(res, "json") else res
+                except Exception:
+                    break
+                items = (data or {}).get("Items") or []
+                if not items:
+                    break
+                items_for_user.extend(items)
+                if len(items) < limit:
+                    break
+                start += limit
+
+            per_user_counts.append((uid, uname, len(items_for_user)))
+            logger.info(f"[{server_name}] [user={uname} (uid={uid[:8]}...)] 被收藏 {len(items_for_user)} 条：")
+            for idx, it in enumerate(items_for_user, 1):
+                t = it.get("Type", "")
+                n = it.get("Name", "")
+                y = it.get("ProductionYear", "")
+                logger.info(f"[{server_name}]   {idx}. {t} | {n}" + (f" ({y})" if y else ""))
+                # 记录去重并集
+                iid = it.get("Id")
+                if iid and iid not in all_favorited:
+                    all_favorited[iid] = it
+
+        logger.info(
+            f"[{server_name}] ===== 合计：按 {self._favorite_scope} 模式会跳过 "
+            f"{len(all_favorited)} 条（去重并集） ====="
+        )
+
+        # 汇总通知（可选）
+        if self._notify:
+            try:
+                ntype = self.__resolve_notification_type()
+                title = "【Emby 收藏诊断】"
+                header_lines = [
+                    f"服务器：{server_name}",
+                    f"scope：{self._favorite_scope}",
+                    f"检查用户数：{len(fav_user_ids)}",
+                    f"去重并集：{len(all_favorited)} 条",
+                    "",
+                    "各用户收藏数：",
+                ]
+                for _, uname, cnt in per_user_counts:
+                    header_lines.append(f"  · {uname}：{cnt}")
+                header_lines.append("")
+                header_lines.append("收藏清单（前 20 条）：")
+
+                preview: List[str] = []
+                total_items = list(all_favorited.values())
+                for idx, it in enumerate(total_items[:20], 1):
+                    n = it.get("Name", "")
+                    y = it.get("ProductionYear", "")
+                    preview.append(f"  {idx}. {n}" + (f" ({y})" if y else ""))
+                remaining = max(0, len(total_items) - 20)
+                if remaining:
+                    preview.append(f"  …还有 {remaining} 条未显示（完整列表见日志）")
+
+                text = "\n".join(header_lines + preview)
+                self.post_message(mtype=ntype, title=title, text=text)
+            except Exception as e:
+                logger.warning(f"[{server_name}] 诊断汇总通知发送失败：{e}")
+
+        logger.info(f"[{server_name}] ===== 收藏诊断结束 =====")
 
     @staticmethod
     def __parse_emby_time(s: str) -> Optional[datetime]:
@@ -737,19 +922,43 @@ class EmbyAutoClean(_PluginBase):
                                 'content': [
                                     {
                                         'component': 'VSwitch',
-                                        'props': {'model': 'notify', 'label': '开启通知'}
+                                        'props': {
+                                            'model': 'diagnose_favorites',
+                                            'label': '收藏诊断（仅输出收藏清单，不删除）'
+                                        }
                                     }
                                 ]
                             },
                         ]
                     },
-                    # 第 2 行：定时 & 通知类型
+                    # 第 1.5 行：诊断提示
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '勾选「收藏诊断」后运行一次（建议配合「立即运行一次」），将不做任何删除，只输出每个用户的收藏清单到日志和通知。用于与 Emby UI 的「最爱」列表对照验证识别是否准确。诊断模式优先级高于 Dry-run。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    # 第 2 行：定时 & 通知开关 & 通知类型
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VCronField',
@@ -763,7 +972,17 @@ class EmbyAutoClean(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'notify', 'label': '开启通知'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VSelect',
@@ -1021,6 +1240,7 @@ class EmbyAutoClean(_PluginBase):
             "onlyonce": False,
             "notify": True,
             "dry_run": True,
+            "diagnose_favorites": False,
             "cron": "0 3 * * *",
             "notify_type": "MediaServer",
             "mediaservers": [],

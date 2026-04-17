@@ -665,12 +665,13 @@
     "name": "Emby媒体自动清理",
     "description": "定期清理 Emby 服务器上添加时间久远且未被收藏的媒体条目，支持多服务器、Dry-run 预演和逐条通知。",
     "labels": "媒体库,Emby,清理",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "clean.png",
     "author": "WWWWM03",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.2.0": "修复候选为 0 的 Bug（主查询切换到 emby/Users/{uid}/Items）；新增「收藏诊断」模式，方便与 Emby UI 最爱列表对照验证识别是否准确。",
       "v1.1.0": "新增手动 Emby 服务器配置（URL+APIKey），支持清理未注册到 MoviePilot 的 Emby 实例。",
       "v1.0.0": "初始版本：支持按添加时间+收藏判定清理 Emby 条目，Dry-run 预演，逐条通知。"
     }
