@@ -71,7 +71,7 @@ class EmbyAutoClean(_PluginBase):
     # 插件图标
     plugin_icon = "clean.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "WWWWM03"
     # 作者主页
@@ -407,9 +407,12 @@ class EmbyAutoClean(_PluginBase):
             qs = "?" + urlencode({k: v for k, v in params.items() if v is not None and v != ""})
         url = f"[HOST]{path}{qs}{'&' if qs else '?'}api_key=[APIKEY]"
         try:
-            return svc.instance.get_data(url=url)
+            res = svc.instance.get_data(url=url)
+            if res is None:
+                logger.warning(f"Emby GET {path} 返回 None（可能是网络错误或超时）")
+            return res
         except Exception as e:
-            logger.warning(f"Emby GET 失败 {path}：{e}")
+            logger.warning(f"Emby GET {path} 异常：{e}")
             return None
 
     @staticmethod
@@ -427,13 +430,18 @@ class EmbyAutoClean(_PluginBase):
                 import requests
                 real_url = url.replace("[HOST]", str(svc.config.config.get("host", "")).rstrip("/") + "/") \
                               .replace("[APIKEY]", str(svc.config.config.get("apikey", "")))
+                logger.debug(f"Emby DELETE 使用 requests 库，URL={real_url[:50]}...")
                 res = requests.delete(real_url, timeout=30)
             if res is None:
+                logger.warning(f"Emby DELETE {path} 返回 None（可能是网络错误）")
                 return False, 0
             code = getattr(res, "status_code", 0)
-            return (200 <= code < 300) or code == 404, code
+            success = (200 <= code < 300) or code == 404
+            if not success:
+                logger.warning(f"Emby DELETE {path} HTTP {code}（非成功状态码）")
+            return success, code
         except Exception as e:
-            logger.warning(f"Emby DELETE 失败 {path}：{e}")
+            logger.error(f"Emby DELETE {path} 异常：{e}", exc_info=True)
             return False, 0
 
     def __resolve_library_ids(self, svc) -> List[str]:
@@ -566,7 +574,10 @@ class EmbyAutoClean(_PluginBase):
         if not item_id:
             return False
         ok, code = self.__emby_delete(svc, f"emby/Items/{item_id}")
-        logger.debug(f"Emby 删除条目 {item_id} 返回 code={code} ok={ok}")
+        if not ok:
+            logger.warning(f"Emby 删除条目 {item_id} 失败，HTTP code={code}")
+        else:
+            logger.debug(f"Emby 删除条目 {item_id} 成功，code={code}")
         return ok
 
     # ───────── 判定 ─────────
