@@ -676,5 +676,19 @@
       "v1.1.0": "新增手动 Emby 服务器配置（URL+APIKey），支持清理未注册到 MoviePilot 的 Emby 实例。",
       "v1.0.0": "初始版本：支持按添加时间+收藏判定清理 Emby 条目，Dry-run 预演，逐条通知。"
     }
+  },
+  "FFmpegStrmThumb": {
+    "name": "FFmpegStrm缩略图",
+    "description": "TheMovieDb没有背景图片时使用FFmpeg截取strm视频文件缩略图。",
+    "labels": "刮削,strm",
+    "version": "2.0",
+    "icon": "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/ffmpegstrm.png",
+    "author": "imaliang",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v2.0": "适配MoviePilot V2版本；新增 /gen_thumb API，支持传入strm路径生成缩略图。",
+      "v1.2": "初始版本"
+    }
   }
 }
